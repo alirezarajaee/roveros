@@ -7,6 +7,7 @@ import {
   type ReactNode,
 } from "react";
 import FaultPanel from "./FaultPanel";
+import EventLog, { type MissionEvent } from "./EventLog";
 import "./App.css";
 
 const API_BASE = "http://127.0.0.1:8081";
@@ -42,12 +43,14 @@ interface MissionSnapshot {
   safety_reason?: string;
   active_faults?: FaultEvent[];
   fault_history?: FaultEvent[];
+  events?: MissionEvent[];
 }
 
 const WIDTH = 20;
 const HEIGHT = 10;
 const DEFAULT_GOAL: Point = { x: 15, y: 7 };
 const EMPTY_PATH: Point[] = [];
+const EMPTY_EVENTS: MissionEvent[] = [];
 
 const ROCKS = new Set([
   "4,2",
@@ -130,7 +133,7 @@ function App() {
     };
   }, []);
 
-  // Execute one real Go simulation step at a time.
+  // Advance the real Go simulation while the mission is running.
   useEffect(() => {
     if (snapshot?.status !== "running") {
       return;
@@ -151,8 +154,8 @@ function App() {
         });
 
         if (!response.ok) {
-          // Re-read canonical state in case another action paused or
-          // completed the mission during this request.
+          // Re-read canonical state if the mission was paused,
+          // completed, or otherwise changed during a request.
           const stateResponse = await fetch(`${API_BASE}/api/state`);
 
           if (!stateResponse.ok) {
@@ -270,6 +273,7 @@ function App() {
 
   const target = snapshot?.target ?? DEFAULT_GOAL;
   const path = snapshot?.path ?? EMPTY_PATH;
+  const events = snapshot?.events ?? EMPTY_EVENTS;
   const steps = snapshot?.steps ?? 0;
   const totalMoves = Math.max(path.length - 1, 1);
   const battery = snapshot?.rover.battery_percent ?? 0;
@@ -667,6 +671,7 @@ function App() {
                   <div className="eyebrow">ONBOARD SYSTEMS</div>
                   <h2>Telemetry</h2>
                 </div>
+
                 <span className="panel-tag">
                   {snapshot ? "LIVE API" : "WAITING"}
                 </span>
@@ -742,6 +747,10 @@ function App() {
 
         <div style={{ marginTop: 16 }}>
           <FaultPanel onStateRefresh={refreshSnapshot} />
+        </div>
+
+        <div style={{ marginTop: 16 }}>
+          <EventLog events={events} />
         </div>
 
         <footer className="page-footer">

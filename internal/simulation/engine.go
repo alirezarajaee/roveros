@@ -6,6 +6,7 @@ import (
 	"sync"
 
 	"github.com/alirezarajaee/roveros/internal/fault"
+	"github.com/alirezarajaee/roveros/internal/mission"
 	"github.com/alirezarajaee/roveros/internal/navigation"
 	"github.com/alirezarajaee/roveros/internal/rover"
 	"github.com/alirezarajaee/roveros/internal/world"
@@ -30,22 +31,24 @@ const (
 	StatusFailed    Status = "failed"
 )
 
-// Snapshot represents a copy of the simulation state.
+// Snapshot represents a copy of the current simulation state.
 type Snapshot struct {
-	Rover        rover.Rover   `json:"rover"`
-	Status       Status        `json:"status"`
-	Target       world.Point   `json:"target"`
-	HasTarget    bool          `json:"has_target"`
-	Path         []world.Point `json:"path"`
-	NextStep     int           `json:"next_step"`
-	Steps        int           `json:"steps"`
-	LastError    string        `json:"last_error,omitempty"`
-	SafetyReason string        `json:"safety_reason,omitempty"`
-	ActiveFaults []fault.Fault `json:"active_faults"`
-	FaultHistory []fault.Fault `json:"fault_history"`
+	Rover        rover.Rover     `json:"rover"`
+	Status       Status          `json:"status"`
+	Target       world.Point     `json:"target"`
+	HasTarget    bool            `json:"has_target"`
+	Path         []world.Point   `json:"path"`
+	NextStep     int             `json:"next_step"`
+	Steps        int             `json:"steps"`
+	LastError    string          `json:"last_error,omitempty"`
+	SafetyReason string          `json:"safety_reason,omitempty"`
+	ActiveFaults []fault.Fault   `json:"active_faults"`
+	FaultHistory []fault.Fault   `json:"fault_history"`
+	Events       []mission.Event `json:"events"`
 }
 
-// Engine coordinates mission planning, rover movement, and fault handling.
+// Engine coordinates mission planning, movement, fault handling,
+// and mission event recording.
 type Engine struct {
 	mu sync.RWMutex
 
@@ -59,7 +62,9 @@ type Engine struct {
 	status       Status
 	lastError    string
 	safetyReason string
+
 	faultManager *fault.Manager
+	eventLog     *mission.Log
 }
 
 // New creates a simulation engine with an idle rover on a walkable cell.
@@ -80,16 +85,25 @@ func New(grid *world.Grid, initialRover rover.Rover) (*Engine, error) {
 		return nil, fmt.Errorf("initial rover position is not walkable")
 	}
 
-	return &Engine{
+	engine := &Engine{
 		grid:         grid,
 		rover:        initialRover,
 		status:       StatusIdle,
 		faultManager: fault.NewManager(),
-	}, nil
+		eventLog:     mission.NewLog(mission.DefaultEventCapacity),
+	}
+
+	engine.recordEvent(
+		"mission_initialized",
+		"info",
+		"Simulation engine initialized",
+	)
+
+	return engine, nil
 }
 
 // Plan calculates a route to the destination.
-// A failed planning attempt preserves the current mission.
+// A failed planning attempt preserves the existing mission state.
 func (e *Engine) Plan(destination world.Point) error {
 	if e == nil {
 		return fmt.Errorf("engine is nil")
@@ -99,11 +113,21 @@ func (e *Engine) Plan(destination world.Point) error {
 	defer e.mu.Unlock()
 
 	if len(e.faultManager.ActiveFaults()) > 0 {
+		e.recordEvent(
+			"mission_plan_blocked",
+			"warning",
+			"Mission planning rejected because sensor faults are active",
+		)
 		return ErrActiveFaults
 	}
 
 	path, err := navigation.FindPath(e.grid, e.rover.Position, destination)
 	if err != nil {
+		e.recordEvent(
+			"mission_plan_failed",
+			"error",
+			fmt.Sprintf("Unable to plan route: %v", err),
+		)
 		return fmt.Errorf("plan mission: %w", err)
 	}
 
@@ -118,14 +142,33 @@ func (e *Engine) Plan(destination world.Point) error {
 
 	if len(path) == 1 {
 		e.status = StatusCompleted
-		return nil
+	} else {
+		e.status = StatusPlanned
 	}
 
-	e.status = StatusPlanned
+	e.recordEvent(
+		"mission_planned",
+		"info",
+		fmt.Sprintf(
+			"Mission planned to (%d, %d) with %d moves",
+			destination.X,
+			destination.Y,
+			len(path)-1,
+		),
+	)
+
+	if e.status == StatusCompleted {
+		e.recordEvent(
+			"mission_completed",
+			"info",
+			"Mission completed because the rover was already at the target",
+		)
+	}
+
 	return nil
 }
 
-// Step advances the rover by one cell along its planned route.
+// Step advances the rover by one cell along the planned route.
 func (e *Engine) Step() (Snapshot, error) {
 	if e == nil {
 		return Snapshot{}, fmt.Errorf("engine is nil")
@@ -154,28 +197,48 @@ func (e *Engine) Step() (Snapshot, error) {
 		)
 	}
 
-	active := e.faultManager.ActiveFaults()
-	if len(active) > 0 {
+	activeFaults := e.faultManager.ActiveFaults()
+	if len(activeFaults) > 0 {
 		e.status = StatusPaused
 		e.rover.Status = rover.StatusPaused
 		e.safetyReason = fmt.Sprintf(
 			"Mission held for safety: %d active sensor fault(s)",
-			len(active),
+			len(activeFaults),
 		)
+
+		e.recordEvent(
+			"mission_paused",
+			"warning",
+			e.safetyReason,
+		)
+
 		return e.snapshotLocked(), ErrMissionPaused
 	}
 
 	if e.nextStep >= len(e.path) {
 		e.status = StatusCompleted
 		e.rover.Status = rover.StatusIdle
+		e.recordEvent(
+			"mission_completed",
+			"info",
+			"Rover reached the mission target",
+		)
 		return e.snapshotLocked(), nil
 	}
 
+	wasPlanned := e.status == StatusPlanned
 	destination := e.path[e.nextStep]
+
 	if err := e.rover.MoveTo(e.grid, destination); err != nil {
 		e.status = StatusFailed
 		e.lastError = err.Error()
 		e.rover.Status = rover.StatusIdle
+
+		e.recordEvent(
+			"mission_failed",
+			"error",
+			fmt.Sprintf("Rover movement failed: %v", err),
+		)
 
 		return e.snapshotLocked(), fmt.Errorf("execute mission step: %w", err)
 	}
@@ -183,9 +246,39 @@ func (e *Engine) Step() (Snapshot, error) {
 	e.nextStep++
 	e.steps++
 
+	if wasPlanned {
+		e.recordEvent(
+			"mission_started",
+			"info",
+			"Mission execution started",
+		)
+	}
+
+	e.recordEvent(
+		"rover_moved",
+		"info",
+		fmt.Sprintf(
+			"Rover moved to (%d, %d); battery %.1f%%",
+			e.rover.Position.X,
+			e.rover.Position.Y,
+			e.rover.BatteryPercent,
+		),
+	)
+
 	if e.rover.Position == e.target {
 		e.status = StatusCompleted
 		e.rover.Status = rover.StatusIdle
+
+		e.recordEvent(
+			"mission_completed",
+			"info",
+			fmt.Sprintf(
+				"Rover reached target (%d, %d) after %d moves",
+				e.target.X,
+				e.target.Y,
+				e.steps,
+			),
+		)
 	} else {
 		e.status = StatusRunning
 	}
@@ -212,6 +305,12 @@ func (e *Engine) Pause() (Snapshot, error) {
 	e.status = StatusPaused
 	e.rover.Status = rover.StatusPaused
 
+	e.recordEvent(
+		"mission_paused",
+		"info",
+		fmt.Sprintf("Mission paused at (%d, %d)", e.rover.Position.X, e.rover.Position.Y),
+	)
+
 	return e.snapshotLocked(), nil
 }
 
@@ -231,16 +330,23 @@ func (e *Engine) Resume() (Snapshot, error) {
 		)
 	}
 
-	active := e.faultManager.ActiveFaults()
-	if len(active) > 0 {
+	activeFaults := e.faultManager.ActiveFaults()
+	if len(activeFaults) > 0 {
 		e.safetyReason = fmt.Sprintf(
 			"Mission held for safety: %d active sensor fault(s)",
-			len(active),
+			len(activeFaults),
 		)
+
+		e.recordEvent(
+			"mission_resume_blocked",
+			"warning",
+			e.safetyReason,
+		)
+
 		return e.snapshotLocked(), fmt.Errorf(
 			"%w: %d active sensor fault(s)",
 			ErrActiveFaults,
-			len(active),
+			len(activeFaults),
 		)
 	}
 
@@ -252,6 +358,16 @@ func (e *Engine) Resume() (Snapshot, error) {
 	} else {
 		e.status = StatusRunning
 	}
+
+	e.recordEvent(
+		"mission_resumed",
+		"info",
+		fmt.Sprintf(
+			"Mission resumed from (%d, %d)",
+			e.rover.Position.X,
+			e.rover.Position.Y,
+		),
+	)
 
 	return e.snapshotLocked(), nil
 }
@@ -269,19 +385,36 @@ func (e *Engine) InjectSensorFailure(
 
 	event, err := e.faultManager.InjectSensorFailure(component)
 	if err != nil {
+		e.recordEvent(
+			"sensor_fault_injection_rejected",
+			"warning",
+			fmt.Sprintf("Sensor fault injection rejected: %v", err),
+		)
 		return fault.Fault{}, err
 	}
 
-	active := e.faultManager.ActiveFaults()
-	if len(active) > 0 {
+	e.recordEvent(
+		"sensor_fault_injected",
+		"warning",
+		fmt.Sprintf("%s failure injected", component),
+	)
+
+	activeFaults := e.faultManager.ActiveFaults()
+	if len(activeFaults) > 0 {
 		e.safetyReason = fmt.Sprintf(
 			"Mission held for safety: %d active sensor fault(s)",
-			len(active),
+			len(activeFaults),
 		)
 
 		if e.status == StatusPlanned || e.status == StatusRunning {
 			e.status = StatusPaused
 			e.rover.Status = rover.StatusPaused
+
+			e.recordEvent(
+				"mission_paused",
+				"warning",
+				e.safetyReason,
+			)
 		}
 	}
 
@@ -302,23 +435,34 @@ func (e *Engine) RecoverSensorFailure(
 
 	event, err := e.faultManager.RecoverSensorFailure(component)
 	if err != nil {
+		e.recordEvent(
+			"sensor_fault_recovery_rejected",
+			"warning",
+			fmt.Sprintf("Sensor fault recovery rejected: %v", err),
+		)
 		return fault.Fault{}, err
 	}
 
-	active := e.faultManager.ActiveFaults()
-	if len(active) == 0 {
+	e.recordEvent(
+		"sensor_fault_recovered",
+		"info",
+		fmt.Sprintf("%s failure recovered", component),
+	)
+
+	activeFaults := e.faultManager.ActiveFaults()
+	if len(activeFaults) == 0 {
 		e.safetyReason = ""
 	} else {
 		e.safetyReason = fmt.Sprintf(
 			"Mission held for safety: %d active sensor fault(s)",
-			len(active),
+			len(activeFaults),
 		)
 	}
 
 	return event, nil
 }
 
-// Snapshot returns a copy of the current simulation state and fault history.
+// Snapshot returns a copy of the current state and retained histories.
 func (e *Engine) Snapshot() Snapshot {
 	if e == nil {
 		return Snapshot{}
@@ -343,5 +487,10 @@ func (e *Engine) snapshotLocked() Snapshot {
 		SafetyReason: e.safetyReason,
 		ActiveFaults: e.faultManager.ActiveFaults(),
 		FaultHistory: e.faultManager.History(),
+		Events:       e.eventLog.List(),
 	}
+}
+
+func (e *Engine) recordEvent(eventType, level, message string) {
+	e.eventLog.Append(eventType, level, message)
 }
