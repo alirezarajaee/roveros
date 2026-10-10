@@ -9,7 +9,7 @@ mission execution, simulated telemetry, sensor fault recovery, and
 real-time mission event logging.
 
 **Built with Go, React, and TypeScript.**
-
+[![ROVEROS CI](https://github.com/alirezarajaee/roveros/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/alirezarajaee/roveros/actions/workflows/ci.yml)
 </div>
 
 ---
