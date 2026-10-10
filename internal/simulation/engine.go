@@ -14,6 +14,7 @@ var (
 	ErrNoMission        = errors.New("no mission has been planned")
 	ErrMissionCompleted = errors.New("mission is already completed")
 	ErrMissionFailed    = errors.New("mission has failed")
+	ErrMissionPaused    = errors.New("mission is paused")
 )
 
 type Status string
@@ -22,11 +23,12 @@ const (
 	StatusIdle      Status = "idle"
 	StatusPlanned   Status = "planned"
 	StatusRunning   Status = "running"
+	StatusPaused    Status = "paused"
 	StatusCompleted Status = "completed"
 	StatusFailed    Status = "failed"
 )
 
-// Snapshot represents a read-only copy of the simulation state.
+// Snapshot represents a copy of the simulation state.
 type Snapshot struct {
 	Rover     rover.Rover   `json:"rover"`
 	Status    Status        `json:"status"`
@@ -79,7 +81,7 @@ func New(grid *world.Grid, initialRover rover.Rover) (*Engine, error) {
 }
 
 // Plan calculates a route to the destination.
-// If planning fails, the current mission state is left unchanged.
+// A failed planning attempt preserves the current mission.
 func (e *Engine) Plan(destination world.Point) error {
 	if e == nil {
 		return fmt.Errorf("engine is nil")
@@ -99,8 +101,6 @@ func (e *Engine) Plan(destination world.Point) error {
 	e.nextStep = 1
 	e.steps = 0
 	e.lastError = ""
-
-	// A new valid plan starts from a stopped rover state.
 	e.rover.Status = rover.StatusIdle
 
 	if len(path) == 1 {
@@ -112,7 +112,7 @@ func (e *Engine) Plan(destination world.Point) error {
 	return nil
 }
 
-// Step advances the rover by one cell along the planned route.
+// Step advances the rover by one cell along its planned route.
 func (e *Engine) Step() (Snapshot, error) {
 	if e == nil {
 		return Snapshot{}, fmt.Errorf("engine is nil")
@@ -123,6 +123,10 @@ func (e *Engine) Step() (Snapshot, error) {
 
 	if !e.hasTarget || e.status == StatusIdle {
 		return e.snapshotLocked(), ErrNoMission
+	}
+
+	if e.status == StatusPaused {
+		return e.snapshotLocked(), ErrMissionPaused
 	}
 
 	if e.status == StatusCompleted {
@@ -158,6 +162,55 @@ func (e *Engine) Step() (Snapshot, error) {
 	if e.rover.Position == e.target {
 		e.status = StatusCompleted
 		e.rover.Status = rover.StatusIdle
+	} else {
+		e.status = StatusRunning
+	}
+
+	return e.snapshotLocked(), nil
+}
+
+// Pause suspends a planned or running mission.
+func (e *Engine) Pause() (Snapshot, error) {
+	if e == nil {
+		return Snapshot{}, fmt.Errorf("engine is nil")
+	}
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if e.status != StatusPlanned && e.status != StatusRunning {
+		return e.snapshotLocked(), fmt.Errorf(
+			"cannot pause mission with status %q",
+			e.status,
+		)
+	}
+
+	e.status = StatusPaused
+	e.rover.Status = rover.StatusPaused
+
+	return e.snapshotLocked(), nil
+}
+
+// Resume resumes a paused mission without resetting its progress.
+func (e *Engine) Resume() (Snapshot, error) {
+	if e == nil {
+		return Snapshot{}, fmt.Errorf("engine is nil")
+	}
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if e.status != StatusPaused {
+		return e.snapshotLocked(), fmt.Errorf(
+			"cannot resume mission with status %q",
+			e.status,
+		)
+	}
+
+	e.rover.Status = rover.StatusIdle
+
+	if e.steps == 0 {
+		e.status = StatusPlanned
 	} else {
 		e.status = StatusRunning
 	}
