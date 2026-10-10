@@ -1,0 +1,26 @@
+# Go build artifacts
+/bin/
+/build/
+*.exe
+*.test
+*.out
+coverage.out
+
+# Node.js and frontend
+node_modules/
+dist/
+.vite/
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+
+# Operating system files
+.DS_Store
+Thumbs.db
