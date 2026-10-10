@@ -35,7 +35,7 @@ interface MissionSnapshot {
 const WIDTH = 20;
 const HEIGHT = 10;
 const DEFAULT_GOAL: Point = { x: 15, y: 7 };
-
+const EMPTY_PATH: Point[] = [];
 const ROCKS = new Set([
   "4,2",
   "4,3",
@@ -235,7 +235,7 @@ function App() {
 
   const currentPosition = snapshot?.rover.position ?? { x: -1, y: -1 };
   const target = snapshot?.target ?? DEFAULT_GOAL;
-  const path = snapshot?.path ?? [];
+  const path = snapshot?.path ?? EMPTY_PATH;
   const steps = snapshot?.steps ?? 0;
   const totalMoves = Math.max(path.length - 1, 1);
   const battery = snapshot?.rover.battery_percent ?? 0;
