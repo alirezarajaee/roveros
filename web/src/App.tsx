@@ -6,6 +6,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
+import FaultPanel from "./FaultPanel";
 import "./App.css";
 
 const API_BASE = "http://127.0.0.1:8081";
@@ -21,6 +22,14 @@ interface RoverState {
   status: string;
 }
 
+interface FaultEvent {
+  id: number;
+  type: string;
+  component: string;
+  status: string;
+  message: string;
+}
+
 interface MissionSnapshot {
   rover: RoverState;
   status: string;
@@ -30,12 +39,16 @@ interface MissionSnapshot {
   next_step: number;
   steps: number;
   last_error?: string;
+  safety_reason?: string;
+  active_faults?: FaultEvent[];
+  fault_history?: FaultEvent[];
 }
 
 const WIDTH = 20;
 const HEIGHT = 10;
 const DEFAULT_GOAL: Point = { x: 15, y: 7 };
 const EMPTY_PATH: Point[] = [];
+
 const ROCKS = new Set([
   "4,2",
   "4,3",
@@ -69,7 +82,19 @@ function App() {
   const [busy, setBusy] = useState(false);
   const requestInFlight = useRef(false);
 
-  // Read the initial mission state from the real Go API.
+  async function refreshSnapshot(): Promise<void> {
+    const response = await fetch(`${API_BASE}/api/state`);
+
+    if (!response.ok) {
+      throw new Error(await responseError(response));
+    }
+
+    const data = (await response.json()) as MissionSnapshot;
+    setSnapshot(data);
+    setError("");
+  }
+
+  // Load the initial mission state from the Go backend.
   useEffect(() => {
     let cancelled = false;
 
@@ -90,7 +115,9 @@ function App() {
       } catch (err) {
         if (!cancelled) {
           setError(
-            err instanceof Error ? err.message : "Could not connect to ROVEROS API",
+            err instanceof Error
+              ? err.message
+              : "Could not connect to ROVEROS API",
           );
         }
       }
@@ -103,7 +130,7 @@ function App() {
     };
   }, []);
 
-  // Advance the real Go simulation while the mission is running.
+  // Execute one real Go simulation step at a time.
   useEffect(() => {
     if (snapshot?.status !== "running") {
       return;
@@ -124,15 +151,16 @@ function App() {
         });
 
         if (!response.ok) {
-          // The mission may have been paused or completed during a request.
-          // Re-read the canonical state before treating this as a connection error.
+          // Re-read canonical state in case another action paused or
+          // completed the mission during this request.
           const stateResponse = await fetch(`${API_BASE}/api/state`);
 
           if (!stateResponse.ok) {
             throw new Error(await responseError(response));
           }
 
-          const latest = (await stateResponse.json()) as MissionSnapshot;
+          const latest =
+            (await stateResponse.json()) as MissionSnapshot;
 
           if (!cancelled) {
             setSnapshot(latest);
@@ -151,7 +179,9 @@ function App() {
       } catch (err) {
         if (!cancelled) {
           setError(
-            err instanceof Error ? err.message : "Simulation request failed",
+            err instanceof Error
+              ? err.message
+              : "Simulation request failed",
           );
         }
       } finally {
@@ -229,16 +259,21 @@ function App() {
         break;
 
       default:
-        setError(`Cannot start a mission with status "${snapshot.status}".`);
+        setError(
+          `Cannot start a mission with status "${snapshot.status}".`,
+        );
     }
   }
 
-  const currentPosition = snapshot?.rover.position ?? { x: -1, y: -1 };
+  const currentPosition =
+    snapshot?.rover.position ?? { x: -1, y: -1 };
+
   const target = snapshot?.target ?? DEFAULT_GOAL;
   const path = snapshot?.path ?? EMPTY_PATH;
   const steps = snapshot?.steps ?? 0;
   const totalMoves = Math.max(path.length - 1, 1);
   const battery = snapshot?.rover.battery_percent ?? 0;
+
   const progress = snapshot
     ? Math.min(100, Math.round((steps / totalMoves) * 100))
     : 0;
@@ -320,18 +355,22 @@ function App() {
           <Icon>◫</Icon>
           <span>Mission overview</span>
         </div>
+
         <div className="nav-item">
           <Icon>⌖</Icon>
           <span>Terrain & navigation</span>
         </div>
+
         <div className="nav-item">
           <Icon>⌁</Icon>
           <span>Rover telemetry</span>
         </div>
+
         <div className="nav-item">
           <Icon>⚙</Icon>
           <span>Subsystem status</span>
         </div>
+
         <div className="nav-item">
           <Icon>≡</Icon>
           <span>Mission events</span>
@@ -340,7 +379,9 @@ function App() {
         <div className="sidebar-bottom">
           <div className="connection-indicator">
             <span className={`status-dot ${snapshot ? "green" : ""}`} />
-            <span>{snapshot ? "GO API CONNECTED" : "CONNECTING TO API"}</span>
+            <span>
+              {snapshot ? "GO API CONNECTED" : "CONNECTING TO API"}
+            </span>
           </div>
           <div className="sidebar-version">ROVEROS / DEV BUILD</div>
         </div>
@@ -362,7 +403,9 @@ function App() {
 
         <section className="page-heading">
           <div>
-            <div className="eyebrow">AUTONOMOUS EXPLORATION PROGRAM</div>
+            <div className="eyebrow">
+              AUTONOMOUS EXPLORATION PROGRAM
+            </div>
             <h1>Mission overview</h1>
             <p>
               Monitor rover navigation, mission progress, and onboard systems.
@@ -371,7 +414,9 @@ function App() {
 
           <div className="mission-identity">
             <span className="mission-id">MISSION / RV-001</span>
-            <span className={`mission-status ${(snapshot?.status ?? "idle").toLowerCase()}`}>
+            <span
+              className={`mission-status ${(snapshot?.status ?? "idle").toLowerCase()}`}
+            >
               <span className="status-dot" />
               {statusLabel}
             </span>
@@ -402,17 +447,22 @@ function App() {
               <span>MISSION PROGRESS</span>
               <span className="metric-symbol">↗</span>
             </div>
+
             <div className="metric-value">
-              {snapshot ? progress : "—"}<span>{snapshot ? "%" : ""}</span>
+              {snapshot ? progress : "—"}
+              <span>{snapshot ? "%" : ""}</span>
             </div>
+
             <div className="progress-track">
               <div
                 className="progress-fill"
                 style={{ width: `${progress}%` }}
               />
             </div>
+
             <div className="metric-foot">
-              STEP {steps.toString().padStart(2, "0")} / {path.length ? totalMoves : "—"}
+              STEP {steps.toString().padStart(2, "0")} /{" "}
+              {path.length ? totalMoves : "—"}
             </div>
           </article>
 
@@ -421,15 +471,19 @@ function App() {
               <span>BATTERY LEVEL</span>
               <span className="metric-symbol">ϟ</span>
             </div>
+
             <div className="metric-value">
-              {snapshot ? Math.round(battery) : "—"}<span>{snapshot ? "%" : ""}</span>
+              {snapshot ? Math.round(battery) : "—"}
+              <span>{snapshot ? "%" : ""}</span>
             </div>
+
             <div className="battery-track">
               <div
                 className={`battery-fill ${battery < 25 ? "low" : ""}`}
                 style={{ width: `${snapshot ? battery : 0}%` }}
               />
             </div>
+
             <div className="metric-foot">GO SIMULATION TELEMETRY</div>
           </article>
 
@@ -438,9 +492,12 @@ function App() {
               <span>TRAVERSED CELLS</span>
               <span className="metric-symbol">⌁</span>
             </div>
+
             <div className="metric-value">
-              {snapshot ? steps : "—"}<span>{snapshot ? " cells" : ""}</span>
+              {snapshot ? steps : "—"}
+              <span>{snapshot ? " cells" : ""}</span>
             </div>
+
             <div className="metric-foot">GRID-BASED DISTANCE</div>
           </article>
 
@@ -449,11 +506,17 @@ function App() {
               <span>ROVER POSITION</span>
               <span className="metric-symbol">⌖</span>
             </div>
+
             <div className="coordinate-value">
-              {snapshot ? currentPosition.x.toString().padStart(2, "0") : "—"}
+              {snapshot
+                ? currentPosition.x.toString().padStart(2, "0")
+                : "—"}
               <span>,</span>
-              {snapshot ? currentPosition.y.toString().padStart(2, "0") : "—"}
+              {snapshot
+                ? currentPosition.y.toString().padStart(2, "0")
+                : "—"}
             </div>
+
             <div className="metric-foot">GRID COORDINATES · X / Y</div>
           </article>
         </section>
@@ -471,7 +534,9 @@ function App() {
             <div className="map-meta">
               <span>
                 <span className={`status-dot ${snapshot ? "green" : ""}`} />
-                {snapshot ? "GO STATE SYNCHRONIZED" : "WAITING FOR BACKEND"}
+                {snapshot
+                  ? "GO STATE SYNCHRONIZED"
+                  : "WAITING FOR BACKEND"}
               </span>
               <span>20 × 10 GRID</span>
             </div>
@@ -492,10 +557,18 @@ function App() {
             </div>
 
             <div className="map-legend">
-              <span><i className="legend-rover">R</i> Rover</span>
-              <span><i className="legend-goal">G</i> Destination</span>
-              <span><i className="legend-obstacle" /> Obstacle</span>
-              <span><i className="legend-path" /> Planned path</span>
+              <span>
+                <i className="legend-rover">R</i> Rover
+              </span>
+              <span>
+                <i className="legend-goal">G</i> Destination
+              </span>
+              <span>
+                <i className="legend-obstacle" /> Obstacle
+              </span>
+              <span>
+                <i className="legend-path" /> Planned path
+              </span>
             </div>
 
             <div className="coordinates-strip">
@@ -503,12 +576,15 @@ function App() {
                 <span className="data-label">START POSITION</span>
                 <strong>(01, 01)</strong>
               </div>
+
               <div>
                 <span className="data-label">TARGET POSITION</span>
                 <strong>
-                  ({target.x.toString().padStart(2, "0")}, {target.y.toString().padStart(2, "0")})
+                  ({target.x.toString().padStart(2, "0")},{" "}
+                  {target.y.toString().padStart(2, "0")})
                 </strong>
               </div>
+
               <div>
                 <span className="data-label">PLANNER</span>
                 <strong>A* SEARCH</strong>
@@ -523,6 +599,7 @@ function App() {
                   <div className="eyebrow">MISSION EXECUTION</div>
                   <h2>Rover control</h2>
                 </div>
+
                 <span className="control-indicator">
                   <span className={`status-dot ${snapshot ? "green" : ""}`} />
                 </span>
@@ -531,9 +608,11 @@ function App() {
               <div className="rover-visual">
                 <div className="rover-orbit orbit-one" />
                 <div className="rover-orbit orbit-two" />
+
                 <div className="rover-core">
                   <span>R</span>
                 </div>
+
                 <div className="rover-coordinate">
                   {snapshot
                     ? `X ${currentPosition.x.toString().padStart(2, "0")} / Y ${currentPosition.y.toString().padStart(2, "0")}`
@@ -599,7 +678,9 @@ function App() {
                   <span>Power subsystem</span>
                   <small>Battery charge</small>
                 </div>
-                <strong>{snapshot ? `${Math.round(battery)}%` : "—"}</strong>
+                <strong>
+                  {snapshot ? `${Math.round(battery)}%` : "—"}
+                </strong>
               </div>
 
               <div className="telemetry-row">
@@ -633,13 +714,35 @@ function App() {
               </div>
 
               {snapshot?.last_error && (
-                <div style={{ padding: "0 16px 14px", color: "#ffb49b", fontSize: 11 }}>
+                <div
+                  style={{
+                    padding: "0 16px 14px",
+                    color: "#ffb49b",
+                    fontSize: 11,
+                  }}
+                >
                   {snapshot.last_error}
+                </div>
+              )}
+
+              {snapshot?.safety_reason && (
+                <div
+                  style={{
+                    padding: "0 16px 14px",
+                    color: "#ffb49b",
+                    fontSize: 11,
+                  }}
+                >
+                  {snapshot.safety_reason}
                 </div>
               )}
             </article>
           </div>
         </section>
+
+        <div style={{ marginTop: 16 }}>
+          <FaultPanel onStateRefresh={refreshSnapshot} />
+        </div>
 
         <footer className="page-footer">
           <span>ROVEROS AUTONOMOUS ROVER SIMULATOR</span>

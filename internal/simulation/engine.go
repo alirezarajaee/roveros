@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/alirezarajaee/roveros/internal/fault"
 	"github.com/alirezarajaee/roveros/internal/navigation"
 	"github.com/alirezarajaee/roveros/internal/rover"
 	"github.com/alirezarajaee/roveros/internal/world"
@@ -15,6 +16,7 @@ var (
 	ErrMissionCompleted = errors.New("mission is already completed")
 	ErrMissionFailed    = errors.New("mission has failed")
 	ErrMissionPaused    = errors.New("mission is paused")
+	ErrActiveFaults     = errors.New("active sensor faults prevent mission execution")
 )
 
 type Status string
@@ -30,29 +32,34 @@ const (
 
 // Snapshot represents a copy of the simulation state.
 type Snapshot struct {
-	Rover     rover.Rover   `json:"rover"`
-	Status    Status        `json:"status"`
-	Target    world.Point   `json:"target"`
-	HasTarget bool          `json:"has_target"`
-	Path      []world.Point `json:"path"`
-	NextStep  int           `json:"next_step"`
-	Steps     int           `json:"steps"`
-	LastError string        `json:"last_error,omitempty"`
+	Rover        rover.Rover   `json:"rover"`
+	Status       Status        `json:"status"`
+	Target       world.Point   `json:"target"`
+	HasTarget    bool          `json:"has_target"`
+	Path         []world.Point `json:"path"`
+	NextStep     int           `json:"next_step"`
+	Steps        int           `json:"steps"`
+	LastError    string        `json:"last_error,omitempty"`
+	SafetyReason string        `json:"safety_reason,omitempty"`
+	ActiveFaults []fault.Fault `json:"active_faults"`
+	FaultHistory []fault.Fault `json:"fault_history"`
 }
 
-// Engine coordinates path planning and rover movement.
+// Engine coordinates mission planning, rover movement, and fault handling.
 type Engine struct {
 	mu sync.RWMutex
 
-	grid      *world.Grid
-	rover     rover.Rover
-	target    world.Point
-	hasTarget bool
-	path      []world.Point
-	nextStep  int
-	steps     int
-	status    Status
-	lastError string
+	grid         *world.Grid
+	rover        rover.Rover
+	target       world.Point
+	hasTarget    bool
+	path         []world.Point
+	nextStep     int
+	steps        int
+	status       Status
+	lastError    string
+	safetyReason string
+	faultManager *fault.Manager
 }
 
 // New creates a simulation engine with an idle rover on a walkable cell.
@@ -74,9 +81,10 @@ func New(grid *world.Grid, initialRover rover.Rover) (*Engine, error) {
 	}
 
 	return &Engine{
-		grid:   grid,
-		rover:  initialRover,
-		status: StatusIdle,
+		grid:         grid,
+		rover:        initialRover,
+		status:       StatusIdle,
+		faultManager: fault.NewManager(),
 	}, nil
 }
 
@@ -90,6 +98,10 @@ func (e *Engine) Plan(destination world.Point) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
+	if len(e.faultManager.ActiveFaults()) > 0 {
+		return ErrActiveFaults
+	}
+
 	path, err := navigation.FindPath(e.grid, e.rover.Position, destination)
 	if err != nil {
 		return fmt.Errorf("plan mission: %w", err)
@@ -101,6 +113,7 @@ func (e *Engine) Plan(destination world.Point) error {
 	e.nextStep = 1
 	e.steps = 0
 	e.lastError = ""
+	e.safetyReason = ""
 	e.rover.Status = rover.StatusIdle
 
 	if len(path) == 1 {
@@ -139,6 +152,17 @@ func (e *Engine) Step() (Snapshot, error) {
 			ErrMissionFailed,
 			e.lastError,
 		)
+	}
+
+	active := e.faultManager.ActiveFaults()
+	if len(active) > 0 {
+		e.status = StatusPaused
+		e.rover.Status = rover.StatusPaused
+		e.safetyReason = fmt.Sprintf(
+			"Mission held for safety: %d active sensor fault(s)",
+			len(active),
+		)
+		return e.snapshotLocked(), ErrMissionPaused
 	}
 
 	if e.nextStep >= len(e.path) {
@@ -191,7 +215,7 @@ func (e *Engine) Pause() (Snapshot, error) {
 	return e.snapshotLocked(), nil
 }
 
-// Resume resumes a paused mission without resetting its progress.
+// Resume resumes a paused mission only when every sensor fault is recovered.
 func (e *Engine) Resume() (Snapshot, error) {
 	if e == nil {
 		return Snapshot{}, fmt.Errorf("engine is nil")
@@ -207,6 +231,20 @@ func (e *Engine) Resume() (Snapshot, error) {
 		)
 	}
 
+	active := e.faultManager.ActiveFaults()
+	if len(active) > 0 {
+		e.safetyReason = fmt.Sprintf(
+			"Mission held for safety: %d active sensor fault(s)",
+			len(active),
+		)
+		return e.snapshotLocked(), fmt.Errorf(
+			"%w: %d active sensor fault(s)",
+			ErrActiveFaults,
+			len(active),
+		)
+	}
+
+	e.safetyReason = ""
 	e.rover.Status = rover.StatusIdle
 
 	if e.steps == 0 {
@@ -218,7 +256,69 @@ func (e *Engine) Resume() (Snapshot, error) {
 	return e.snapshotLocked(), nil
 }
 
-// Snapshot returns a copy of the current simulation state.
+// InjectSensorFailure records a fault and pauses an active mission for safety.
+func (e *Engine) InjectSensorFailure(
+	component fault.Component,
+) (fault.Fault, error) {
+	if e == nil {
+		return fault.Fault{}, fmt.Errorf("engine is nil")
+	}
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	event, err := e.faultManager.InjectSensorFailure(component)
+	if err != nil {
+		return fault.Fault{}, err
+	}
+
+	active := e.faultManager.ActiveFaults()
+	if len(active) > 0 {
+		e.safetyReason = fmt.Sprintf(
+			"Mission held for safety: %d active sensor fault(s)",
+			len(active),
+		)
+
+		if e.status == StatusPlanned || e.status == StatusRunning {
+			e.status = StatusPaused
+			e.rover.Status = rover.StatusPaused
+		}
+	}
+
+	return event, nil
+}
+
+// RecoverSensorFailure records recovery.
+// A paused mission must be explicitly resumed after all faults are cleared.
+func (e *Engine) RecoverSensorFailure(
+	component fault.Component,
+) (fault.Fault, error) {
+	if e == nil {
+		return fault.Fault{}, fmt.Errorf("engine is nil")
+	}
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	event, err := e.faultManager.RecoverSensorFailure(component)
+	if err != nil {
+		return fault.Fault{}, err
+	}
+
+	active := e.faultManager.ActiveFaults()
+	if len(active) == 0 {
+		e.safetyReason = ""
+	} else {
+		e.safetyReason = fmt.Sprintf(
+			"Mission held for safety: %d active sensor fault(s)",
+			len(active),
+		)
+	}
+
+	return event, nil
+}
+
+// Snapshot returns a copy of the current simulation state and fault history.
 func (e *Engine) Snapshot() Snapshot {
 	if e == nil {
 		return Snapshot{}
@@ -232,13 +332,16 @@ func (e *Engine) Snapshot() Snapshot {
 
 func (e *Engine) snapshotLocked() Snapshot {
 	return Snapshot{
-		Rover:     e.rover,
-		Status:    e.status,
-		Target:    e.target,
-		HasTarget: e.hasTarget,
-		Path:      append([]world.Point(nil), e.path...),
-		NextStep:  e.nextStep,
-		Steps:     e.steps,
-		LastError: e.lastError,
+		Rover:        e.rover,
+		Status:       e.status,
+		Target:       e.target,
+		HasTarget:    e.hasTarget,
+		Path:         append([]world.Point(nil), e.path...),
+		NextStep:     e.nextStep,
+		Steps:        e.steps,
+		LastError:    e.lastError,
+		SafetyReason: e.safetyReason,
+		ActiveFaults: e.faultManager.ActiveFaults(),
+		FaultHistory: e.faultManager.History(),
 	}
 }
